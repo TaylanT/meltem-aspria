@@ -1,0 +1,51 @@
+enabled: true
+dry_run: true
+
+club:
+  name: Aspria Hannover Maschsee
+  booking_url: https://www.aspria.com/de/hannover-maschsee
+
+courses:
+  - LES MILLS BODYPUMP
+  - Hyrox Starter
+
+time_windows:
+  tuesday:
+    - from: "00:00"
+      to: "11:00"
+  thursday:
+    - from: "18:00"
+      to: "23:59"
+  friday:
+    - from: "18:00"
+      to: "23:59"
+  saturday:
+    - from: "09:00"
+      to: "20:00"
+  sunday:
+    - from: "09:00"
+      to: "20:00"
+
+release_job:
+  poll_start: "20:58"
+  tight_poll_until: "21:10"
+  tight_interval_seconds: 5
+  slow_poll_until: "22:00"
+  slow_interval_seconds: 60
+
+hourly_job:
+  lookahead_days: 3
+
+matching:
+  exact_normalized: true
+  fuzzy: false
+
+default_duration_minutes: 60
+buffer_minutes: 15
+
+retention:
+  history_days: 90
+  artifacts_days: 14
+
+notifications:
+  enabled: false

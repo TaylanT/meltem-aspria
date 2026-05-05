@@ -116,11 +116,15 @@ class AspriaBookingPageCollectionSource:
     def _open_booking_page(self) -> None:
         if self._booking_url is not None:
             self._page.goto(self._booking_url, wait_until="domcontentloaded")
+            _dismiss_cookie_banner(self._page)
             if _looks_like_booking_page(str(self._page.content())):
                 return
         self._page.goto(self._fallback_url, wait_until="domcontentloaded")
+        _dismiss_cookie_banner(self._page)
         _click_first_available(self._page, ("a:has-text('Kurs Buchen')", "button:has-text('Kurs Buchen')"))
         _settle_booking_context(self._page)
+        _dismiss_cookie_banner(self._page)
+        _wait_for_mywellness_text(self._page)
 
     def _select_scan_date(self, scan_date: date) -> None:
         booking_context = self._booking_context()
@@ -1178,6 +1182,32 @@ def _looks_like_booking_page(html: str) -> bool:
         marker in normalized
         for marker in ("meine buchungen", "freie plaetze", "warteliste")
     ) or re.search(r"\b\d{2}\.\d{2}\.\d{4}\s+[0-2]\d:[0-5]\d\b", normalized) is not None
+
+
+_COOKIE_CONSENT_SELECTORS = (
+    "#accept-btn",
+    "#qc-cmp2-container #accept-btn",
+    "button:has-text('ZUSTIMMEN')",
+    "button:has-text('ALLE AKZEPTIEREN')",
+    "button:has-text('ACCEPT ALL')",
+    "button:has-text('Accept all')",
+)
+
+
+def _dismiss_cookie_banner(page: Any) -> None:
+    if _click_first_available(page, _COOKIE_CONSENT_SELECTORS):
+        _settle_booking_context(page)
+
+
+def _wait_for_mywellness_text(page: Any) -> None:
+    for _ in range(15):
+        for frame in getattr(page, "frames", []):
+            if "widgets.mywellness.com" in str(getattr(frame, "url", "")) and _visible_text(frame).strip():
+                return
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            return
 
 
 def _click_first_available(page: Any, selectors: tuple[str, ...]) -> bool:

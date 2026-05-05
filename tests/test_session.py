@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
-from aspria_booker.config import ClubConfig
 from aspria_booker.artifacts import ArtifactStore
+from aspria_booker.config import ClubConfig
 from aspria_booker.session import (
     BrowserProbe,
     BrowserSessionManager,
@@ -145,6 +146,42 @@ def test_session_saves_manual_intervention_artifact_with_run_id(tmp_path: Path) 
     assert "ASPRIA_PASSWORD" in (artifact_dirs[0] / "metadata.json").read_text(encoding="utf-8")
 
 
+def test_session_saves_login_page_diagnostics_for_protective_challenge(tmp_path: Path) -> None:
+    manager = BrowserSessionManager(
+        club=ClubConfig(
+            name="Aspria Hannover Maschsee",
+            booking_url="https://example.invalid/book",
+            storage_state_path=str(tmp_path / "state.json"),
+        ),
+        secrets={"ASPRIA_EMAIL": "person@example.invalid", "ASPRIA_PASSWORD": "server-password-secret"},
+        probe=FakeProbe(
+            storage_valid=False,
+            login_outcome=LoginOutcome(
+                LoginStatus.PROTECTIVE_CHALLENGE,
+                "challenge visible",
+                artifact_html="<main>Captcha erforderlich</main>",
+                artifact_screenshot=b"fake-png",
+                artifact_metadata={
+                    "page_url": "https://example.invalid/challenge",
+                    "matched_protective_markers": ["captcha"],
+                },
+            ),
+        ),
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+    )
+
+    outcome = manager.ensure_authenticated(run_id="run-login")
+
+    assert outcome.status is LoginStatus.PROTECTIVE_CHALLENGE
+    artifact_dirs = list((tmp_path / "artifacts" / "run-login").glob("*-manual-intervention"))
+    assert len(artifact_dirs) == 1
+    assert (artifact_dirs[0] / "page.html").read_text(encoding="utf-8") == "<main>Captcha erforderlich</main>"
+    assert (artifact_dirs[0] / "screenshot.png").read_bytes() == b"fake-png"
+    metadata = json.loads((artifact_dirs[0] / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["page_url"] == "https://example.invalid/challenge"
+    assert metadata["matched_protective_markers"] == ["captcha"]
+
+
 class FakeLocator:
     def __init__(self, page: "FakePage", selector: str) -> None:
         self._page = page
@@ -166,8 +203,14 @@ class FakeLocator:
         self._page.clicked.append(self._selector)
         if self._page.after_click_html is not None:
             self._page.html = self._page.after_click_html
+            self._page.visible_text = self._page.after_click_html
         if self._page.after_click_url is not None:
             self._page.url = self._page.after_click_url
+
+    def inner_text(self, *, timeout: int | None = None) -> str:
+        if self._selector == "body":
+            return self._page.visible_text
+        return ""
 
 
 class FakePage:
@@ -179,8 +222,10 @@ class FakePage:
         after_click_html: str | None = None,
         after_click_url: str | None = None,
         fill_error: Exception | None = None,
+        visible_text: str | None = None,
     ) -> None:
         self.html = html
+        self.visible_text = visible_text if visible_text is not None else html
         self.url = url
         self.after_click_html = after_click_html
         self.after_click_url = after_click_url
@@ -192,8 +237,14 @@ class FakePage:
     def goto(self, url: str, *, wait_until: str | None = None) -> None:
         self.visited.append(url)
 
+    def title(self) -> str:
+        return "Fake Login Page"
+
     def content(self) -> str:
         return self.html
+
+    def screenshot(self, *, full_page: bool) -> bytes:
+        return b"fake-screenshot"
 
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self, selector)
@@ -295,6 +346,42 @@ def test_playwright_probe_treats_login_form_as_expired_storage(tmp_path: Path) -
     )
 
     assert valid is False
+
+
+def test_playwright_probe_accepts_public_start_page_when_storage_exists(tmp_path: Path) -> None:
+    storage_path = tmp_path / "state.json"
+    page = FakePage(
+        html="<script>captcha bot</script><main>Aspria Hannover Maschsee Kurs Buchen</main>",
+        visible_text="Aspria Hannover Maschsee Kurs Buchen",
+    )
+    context = FakeContext(page)
+    browser = FakeBrowser(context)
+    probe = PlaywrightBrowserProbe(playwright_factory=FakePlaywrightFactory(FakePlaywright(browser)))
+
+    valid = probe.is_storage_state_valid(
+        start_url="https://example.invalid/book",
+        storage_state_path=storage_path,
+    )
+
+    assert valid is True
+
+
+def test_playwright_probe_does_not_treat_marketing_angebote_as_bot_challenge(tmp_path: Path) -> None:
+    storage_path = tmp_path / "state.json"
+    page = FakePage(
+        html="<main>Maßgeschneiderte Mitgliedschaftsangebote</main>",
+        visible_text="Maßgeschneiderte Mitgliedschaftsangebote",
+    )
+    context = FakeContext(page)
+    browser = FakeBrowser(context)
+    probe = PlaywrightBrowserProbe(playwright_factory=FakePlaywrightFactory(FakePlaywright(browser)))
+
+    valid = probe.is_storage_state_valid(
+        start_url="https://example.invalid/book",
+        storage_state_path=storage_path,
+    )
+
+    assert valid is True
 
 
 def test_playwright_probe_headless_relogin_saves_refreshed_storage_state(tmp_path: Path) -> None:

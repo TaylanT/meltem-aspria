@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from aspria_booker.history import ActionType, HistoryStore
+from aspria_booker.history import SQLITE_BUSY_TIMEOUT_MS, ActionType, HistoryStore
 
 
 def store(tmp_path: Path) -> HistoryStore:
@@ -45,6 +45,14 @@ def test_runs_observations_and_actions_are_recorded_with_stable_ids(tmp_path: Pa
             "scan_date": "2026-05-06",
         }
     ]
+
+
+def test_history_connection_waits_for_temporary_sqlite_locks(tmp_path: Path) -> None:
+    history = store(tmp_path)
+
+    row = history._connection.execute("PRAGMA busy_timeout").fetchone()
+
+    assert row[0] == SQLITE_BUSY_TIMEOUT_MS
 
 
 def test_action_notification_deduplication_can_be_checked_before_sending(tmp_path: Path) -> None:

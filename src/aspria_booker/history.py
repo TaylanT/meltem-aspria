@@ -8,6 +8,8 @@ from uuid import uuid4
 
 
 ActionType = Literal["booking", "waitlist", "no_op", "failure"]
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
+SQLITE_BUSY_TIMEOUT_MS = SQLITE_BUSY_TIMEOUT_SECONDS * 1000
 
 
 class HistoryStore:
@@ -17,13 +19,14 @@ class HistoryStore:
         self._connection = connection
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         self._ensure_schema()
 
     @classmethod
     def open(cls, path: str | Path) -> HistoryStore:
         db_path = Path(path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        return cls(sqlite3.connect(db_path))
+        return cls(sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS))
 
     def start_run(
         self,

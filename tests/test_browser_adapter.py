@@ -12,6 +12,8 @@ from aspria_booker.browser_adapter import (
     BrowserExistingState,
     DryRunBrowserCollector,
     VerifiedActionRunner,
+    _course_observations_from_mywellness_text,
+    _mywellness_text_matches_date,
 )
 from aspria_booker.artifacts import ArtifactStore
 from aspria_booker.config import (
@@ -292,6 +294,29 @@ def test_dry_run_collector_saves_artifacts_for_unclear_observations(tmp_path: Pa
     assert (artifact_dir / "metadata.json").exists()
 
 
+def test_dry_run_collector_saves_artifact_when_no_observations_are_found(tmp_path: Path) -> None:
+    history = store(tmp_path)
+    run_id = history.start_run(command="scan", run_id="run-dry-empty")
+    source = FakeCourseSource(
+        observations=[],
+        existing_states=[],
+        select_dates=[],
+        artifact_html="<html><body>marketing page</body></html>",
+    )
+
+    DryRunBrowserCollector(
+        config=config(),
+        history=history,
+        source=source,
+        artifacts=ArtifactStore(tmp_path / "artifacts"),
+    ).collect(run_id=run_id, scan_dates=[date(2026, 5, 5)])
+
+    artifact_dirs = list((tmp_path / "artifacts" / run_id).glob("*-unclear-status"))
+    assert len(artifact_dirs) == 1
+    assert (artifact_dirs[0] / "page.html").read_text(encoding="utf-8") == "<html><body>marketing page</body></html>"
+    assert "no_observations" in (artifact_dirs[0] / "metadata.json").read_text(encoding="utf-8")
+
+
 def test_live_runner_books_free_target_and_sends_deduped_success_notification(tmp_path: Path) -> None:
     history = store(tmp_path)
     run_id = history.start_run(command="release", run_id="run-live-book")
@@ -518,6 +543,43 @@ def test_live_runner_records_and_notifies_full_course_without_waitlist(tmp_path:
     assert "needs review" in mailer.messages[0]["Subject"]
 
 
+def test_live_runner_records_pending_release_without_clicking_or_notifying(tmp_path: Path) -> None:
+    history = store(tmp_path)
+    run_id = history.start_run(command="release", run_id="run-pending-release")
+    mailer = CapturingMailer()
+    source = FakeActionSource(
+        observations=[
+            BrowserCourseObservation(
+                name="LES MILLS BODYPUMP",
+                day=date(2026, 5, 7),
+                start=time(18, 30),
+                duration_minutes=60,
+                status="pending_release",
+                available_action=None,
+            )
+        ],
+        existing_states=[],
+        selected_dates=[],
+    )
+
+    result = VerifiedActionRunner(
+        config=live_config(),
+        history=history,
+        source=source,
+        notifications=NotificationService(history=history, mailer=mailer),
+    ).run(run_id=run_id, scan_dates=[date(2026, 5, 7)], dry_run=False)
+
+    assert source.booking_clicks == []
+    assert source.waitlist_clicks == []
+    assert [(decision.action_type, decision.result, decision.reason) for decision in result.decisions] == [
+        ("no_op", "pending_release", "course is visible but not released for booking yet")
+    ]
+    assert [(action["action_type"], action["result"]) for action in history.actions_for_run(run_id)] == [
+        ("no_op", "pending_release")
+    ]
+    assert mailer.messages == []
+
+
 def test_live_runner_records_unclear_verification_as_failure(tmp_path: Path) -> None:
     history = store(tmp_path)
     run_id = history.start_run(command="release", run_id="run-verify-unclear")
@@ -637,6 +699,12 @@ class FakeBookingPage:
     def content(self) -> str:
         return self.pages.get(self.url, "")
 
+    def title(self) -> str:
+        return "Fake Booking Page"
+
+    def screenshot(self, *, full_page: bool) -> bytes:
+        return b"fake-screenshot"
+
     def locator(self, selector: str) -> FakePageLocator:
         return FakePageLocator(self, selector)
 
@@ -664,6 +732,7 @@ def test_aspria_page_source_falls_back_selects_date_and_collects_german_course_s
                 <main>
                   <article>LES MILLS BODYPUMP 05.05.2026 10:00 60 Min. Freie Plaetze Buchen</article>
                   <article>Hyrox Starter 05.05.2026 18:30 Warteliste moeglich Warteliste</article>
+                  <article>Yoga 05.05.2026 19:30 60 Min. Buchung ab 04.05.2026 21:00</article>
                   <section>Meine Buchungen LES MILLS BODYPUMP 05.05.2026 10:00 Gebucht</section>
                   <section>Meine Warteliste Hyrox Starter 05.05.2026 18:30 Warteliste</section>
                 </main>
@@ -698,6 +767,14 @@ def test_aspria_page_source_falls_back_selects_date_and_collects_german_course_s
             status="waitlist_possible",
             available_action="waitlist",
         ),
+        BrowserCourseObservation(
+            name="Yoga",
+            day=date(2026, 5, 5),
+            start=time(19, 30),
+            duration_minutes=60,
+            status="pending_release",
+            available_action=None,
+        ),
     ]
     assert existing_states == [
         BrowserExistingState(
@@ -715,6 +792,119 @@ def test_aspria_page_source_falls_back_selects_date_and_collects_german_course_s
             duration_minutes=None,
         ),
     ]
+
+
+def test_aspria_page_source_does_not_treat_public_kurs_buchen_link_as_booking_page() -> None:
+    page = FakeBookingPage(
+        {
+            "https://www.aspria.com/de/hannover-maschsee": "<main><a>Kurs Buchen</a></main>",
+            "https://example.invalid/kursbuchung": "<button>05.05.2026</button>",
+            "https://example.invalid/kursbuchung?date=2026-05-05": """
+                <article>LES MILLS BODYPUMP 05.05.2026 10:00 60 Min. Freie Plaetze Buchen</article>
+            """,
+        }
+    )
+
+    observations, _ = AspriaBookingPageCollectionSource(
+        page=page,
+        booking_url="https://www.aspria.com/de/hannover-maschsee",
+    ).collect([date(2026, 5, 5)])
+
+    assert page.clicked == ["a:has-text('Kurs Buchen')", "button:has-text('05.05.2026')"]
+    assert [observation.name for observation in observations] == ["LES MILLS BODYPUMP"]
+
+
+def test_mywellness_visible_text_parser_extracts_course_rows() -> None:
+    observations = _course_observations_from_mywellness_text(
+        """
+        BOOK
+        Aspria Hannover
+        Monday, 4 May
+        8:00 AM - 8:45 AM
+        LES MILLS BODYPUMP
+        trainer
+        HEINE NATASCHA
+        room
+        Shape
+        BOOK
+        6:15 PM - 7:15 PM
+        Hyrox Starter
+        trainer
+        TEAM
+        room
+        Functional Area
+        """,
+        date(2026, 5, 4),
+    )
+
+    assert observations[:2] == [
+        BrowserCourseObservation(
+            name="LES MILLS BODYPUMP",
+            day=date(2026, 5, 4),
+            start=time(8, 0),
+            duration_minutes=45,
+            status="free",
+            available_action="book",
+        ),
+        BrowserCourseObservation(
+            name="Hyrox Starter",
+            day=date(2026, 5, 4),
+            start=time(18, 15),
+            duration_minutes=60,
+            status="pending_release",
+            available_action=None,
+        ),
+    ]
+
+
+def test_mywellness_visible_text_parser_marks_unpublished_course_as_pending_release() -> None:
+    observations = _course_observations_from_mywellness_text(
+        """
+        Aspria Hannover
+        Thursday, 7 May
+        6:15 PM - 7:15 PM
+        Hyrox Starter
+        trainer
+        TEAM
+        room
+        Functional Area
+        """,
+        date(2026, 5, 7),
+    )
+
+    assert observations == [
+        BrowserCourseObservation(
+            name="Hyrox Starter",
+            day=date(2026, 5, 7),
+            start=time(18, 15),
+            duration_minutes=60,
+            status="pending_release",
+            available_action=None,
+        )
+    ]
+
+
+def test_mywellness_visible_text_parser_rejects_wrong_visible_day() -> None:
+    observations = _course_observations_from_mywellness_text(
+        """
+        Monday, 4 May
+        7:30 PM - 8:30 PM
+        LES MILLS BODYPUMP
+        trainer
+        TEAM
+        room
+        Shape
+        BOOK
+        """,
+        date(2026, 5, 7),
+    )
+
+    assert observations == []
+
+
+def test_mywellness_text_matches_exact_english_heading_date() -> None:
+    assert _mywellness_text_matches_date("Thursday, 7 May 6:50 PM - 7:50 PM", date(2026, 5, 7)) is True
+    assert _mywellness_text_matches_date("Monday, 4 May 7:30 PM - 8:30 PM", date(2026, 5, 7)) is False
 
 
 def test_aspria_page_source_does_not_use_english_fallback_status_texts() -> None:

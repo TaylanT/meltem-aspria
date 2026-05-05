@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, TypedDict
 
 from aspria_booker.artifacts import ArtifactStore
 from aspria_booker.config import BookerConfig, ClubConfig
@@ -25,10 +25,19 @@ class LoginStatus(Enum):
 class LoginOutcome:
     status: LoginStatus
     message: str
+    artifact_html: str | None = None
+    artifact_screenshot: bytes | None = None
+    artifact_metadata: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
         return self.status in {LoginStatus.AUTHENTICATED, LoginStatus.REUSED_STORAGE}
+
+
+class _LoginArtifact(TypedDict):
+    artifact_html: str | None
+    artifact_screenshot: bytes | None
+    artifact_metadata: dict[str, Any]
 
 
 class BrowserProbe(Protocol):
@@ -97,11 +106,14 @@ class BrowserSessionManager:
             run_id=run_id or "login",
             trigger="manual_intervention",
             occurred_at=datetime.now(timezone.utc),
+            html=outcome.artifact_html,
+            screenshot=outcome.artifact_screenshot,
             metadata={
                 "status": outcome.status.value,
                 "message": outcome.message,
                 "start_url": start_url,
                 "required_secrets": ["ASPRIA_EMAIL", "ASPRIA_PASSWORD"],
+                **(outcome.artifact_metadata or {}),
             },
         )
 
@@ -167,8 +179,9 @@ class PlaywrightBrowserProbe:
                 try:
                     context = browser.new_context(storage_state=str(storage_state_path))
                     page = context.new_page()
-                    page.goto(start_url, wait_until="networkidle")
-                    return _classify_login_page(page) is _LoginPageState.AUTHENTICATED
+                    page.goto(start_url, wait_until="domcontentloaded")
+                    state = _classify_login_page(page)
+                    return state in {_LoginPageState.AUTHENTICATED, _LoginPageState.UNKNOWN}
                 finally:
                     browser.close()
         except Exception:
@@ -188,7 +201,7 @@ class PlaywrightBrowserProbe:
                 try:
                     context = browser.new_context()
                     page = context.new_page()
-                    page.goto(start_url, wait_until="networkidle")
+                    page.goto(start_url, wait_until="domcontentloaded")
                     initial_state = _classify_login_page(page)
                     if initial_state is _LoginPageState.AUTHENTICATED:
                         storage_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,11 +211,13 @@ class PlaywrightBrowserProbe:
                         return LoginOutcome(
                             LoginStatus.PROTECTIVE_CHALLENGE,
                             "login stopped because a protective challenge or manual verification page is visible",
+                            **_login_artifact(page, state=initial_state),
                         )
                     if initial_state is _LoginPageState.UNKNOWN:
                         return LoginOutcome(
                             LoginStatus.MANUAL_INTERVENTION_REQUIRED,
                             "login stopped because the page state was not a recognizable login form",
+                            **_login_artifact(page, state=initial_state),
                         )
 
                     _fill_first(page, _EMAIL_SELECTORS, email)
@@ -217,10 +232,12 @@ class PlaywrightBrowserProbe:
                         return LoginOutcome(
                             LoginStatus.PROTECTIVE_CHALLENGE,
                             "login stopped because a protective challenge or manual verification page appeared",
+                            **_login_artifact(page, state=next_state),
                         )
                     return LoginOutcome(
                         LoginStatus.MANUAL_INTERVENTION_REQUIRED,
                         "login form did not reach an authenticated booking page",
+                        **_login_artifact(page, state=next_state),
                     )
                 finally:
                     browser.close()
@@ -240,9 +257,10 @@ class _LoginPageState(Enum):
 
 _AUTHENTICATED_TEXTS = (
     "meine buchungen",
-    "kurs buchen",
-    "buchung",
     "abmelden",
+    "freie plätze",
+    "freie plaetze",
+    "warteliste",
 )
 _LOGIN_TEXTS = (
     "anmelden",
@@ -261,7 +279,6 @@ _PROTECTIVE_TEXTS = (
     "suspicious activity",
     "automation",
     "automatisierung",
-    "bot",
 )
 _EMAIL_SELECTORS = (
     "input[type='email']",
@@ -290,22 +307,72 @@ def _default_playwright_factory() -> Any:
 
 def _classify_login_page(page: Any) -> _LoginPageState:
     text = _normalized_page_text(page)
-    if any(marker in text for marker in _PROTECTIVE_TEXTS):
+    if _matched_markers(text, _PROTECTIVE_TEXTS):
         return _LoginPageState.PROTECTIVE_CHALLENGE
-    if _has_any_locator(page, _PASSWORD_SELECTORS) or any(marker in text for marker in _LOGIN_TEXTS):
+    if _has_any_locator(page, _PASSWORD_SELECTORS) or _matched_markers(text, _LOGIN_TEXTS):
         return _LoginPageState.LOGIN_FORM
-    if any(marker in text for marker in _AUTHENTICATED_TEXTS):
+    if _matched_markers(text, _AUTHENTICATED_TEXTS):
         return _LoginPageState.AUTHENTICATED
     return _LoginPageState.UNKNOWN
 
 
-def _normalized_page_text(page: Any) -> str:
+def _login_artifact(page: Any, *, state: _LoginPageState) -> _LoginArtifact:
+    return {
+        "artifact_html": _safe_page_content(page),
+        "artifact_screenshot": _safe_page_screenshot(page),
+        "artifact_metadata": _page_metadata(page, state=state),
+    }
+
+
+def _page_metadata(page: Any, *, state: _LoginPageState) -> dict[str, object]:
+    text = _normalized_page_text(page)
+    title = ""
     try:
-        content = str(page.content())
+        title = str(page.title())
     except Exception:
-        content = ""
+        title = ""
+    return {
+        "page_url": str(getattr(page, "url", "")),
+        "page_title": title,
+        "login_state": state.value,
+        "matched_protective_markers": _matched_markers(text, _PROTECTIVE_TEXTS),
+        "matched_login_markers": _matched_markers(text, _LOGIN_TEXTS),
+        "matched_signed_in_markers": _matched_markers(text, _AUTHENTICATED_TEXTS),
+    }
+
+
+def _matched_markers(text: str, markers: tuple[str, ...]) -> list[str]:
+    return [marker for marker in markers if marker in text]
+
+
+def _safe_page_content(page: Any) -> str | None:
+    try:
+        return str(page.content())
+    except Exception:
+        return None
+
+
+def _safe_page_screenshot(page: Any) -> bytes | None:
+    try:
+        return bytes(page.screenshot(full_page=True))
+    except Exception:
+        return None
+
+
+def _normalized_page_text(page: Any) -> str:
+    content = _visible_page_text(page)
     url = str(getattr(page, "url", ""))
     return f"{url}\n{content}".lower()
+
+
+def _visible_page_text(page: Any) -> str:
+    try:
+        return str(page.locator("body").inner_text(timeout=1000))
+    except Exception:
+        try:
+            return str(page.content())
+        except Exception:
+            return ""
 
 
 def _has_any_locator(page: Any, selectors: tuple[str, ...]) -> bool:

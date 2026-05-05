@@ -14,7 +14,7 @@ from aspria_booker.rules import ExistingCourseState, ExistingState, ObservedCour
 from aspria_booker.session import ASPRIA_HANNOVER_MASCHSEE_URL, booking_start_url, configured_storage_state_path
 
 
-CourseStatus = Literal["booked", "waitlisted", "free", "full", "waitlist_possible", "unclear"]
+CourseStatus = Literal["booked", "waitlisted", "free", "full", "waitlist_possible", "pending_release", "unclear"]
 AvailableAction = Literal["book", "waitlist"]
 
 
@@ -105,20 +105,28 @@ class AspriaBookingPageCollectionSource:
         self._open_booking_page()
         for scan_date in scan_dates:
             self._select_scan_date(scan_date)
-            page_text_blocks = _extract_visible_text_blocks(str(self._page.content()))
+            booking_context = self._booking_context()
+            page_text = _visible_text(booking_context)
+            page_text_blocks = _extract_visible_text_blocks(page_text or str(self._page.content()))
             observations.extend(_course_observations_from_blocks(page_text_blocks, scan_date))
+            observations.extend(_course_observations_from_mywellness_text(page_text, scan_date))
             existing_states.extend(_existing_states_from_blocks(page_text_blocks, scan_date))
         return observations, existing_states
 
     def _open_booking_page(self) -> None:
         if self._booking_url is not None:
-            self._page.goto(self._booking_url, wait_until="networkidle")
+            self._page.goto(self._booking_url, wait_until="domcontentloaded")
             if _looks_like_booking_page(str(self._page.content())):
                 return
-        self._page.goto(self._fallback_url, wait_until="networkidle")
+        self._page.goto(self._fallback_url, wait_until="domcontentloaded")
         _click_first_available(self._page, ("a:has-text('Kurs Buchen')", "button:has-text('Kurs Buchen')"))
+        _settle_booking_context(self._page)
 
     def _select_scan_date(self, scan_date: date) -> None:
+        booking_context = self._booking_context()
+        if _is_mywellness_context(booking_context):
+            _select_mywellness_date(self._page, booking_context, scan_date)
+            return
         date_texts = (
             scan_date.strftime("%d.%m.%Y"),
             scan_date.strftime("%-d.%-m.%Y"),
@@ -129,7 +137,21 @@ class AspriaBookingPageCollectionSource:
             for text in date_texts
             for selector in (f"button:has-text('{text}')", f"a:has-text('{text}')")
         )
-        _click_first_available(self._page, selectors)
+        _click_first_available(booking_context, selectors)
+        _settle_booking_context(self._page)
+
+    def _booking_context(self) -> Any:
+        for frame in getattr(self._page, "frames", []):
+            if "widgets.mywellness.com" in str(getattr(frame, "url", "")):
+                return frame
+        return self._page
+
+    def diagnostic_artifacts(
+        self,
+        *,
+        observation: BrowserCourseObservation | None,
+    ) -> tuple[str | None, bytes | None, dict[str, object]]:
+        return _page_diagnostic_artifacts(self._page, observation=observation)
 
 
 class PlaywrightCourseCollectionSource:
@@ -141,6 +163,7 @@ class PlaywrightCourseCollectionSource:
     ) -> None:
         self._config = config
         self._playwright_factory = playwright_factory or _default_playwright_factory
+        self._last_diagnostics: tuple[str | None, bytes | None, dict[str, object]] = (None, None, {})
 
     def collect(
         self,
@@ -155,12 +178,22 @@ class PlaywrightCourseCollectionSource:
                     context_kwargs["storage_state"] = str(storage_state_path)
                 context = browser.new_context(**context_kwargs)
                 page = context.new_page()
-                return AspriaBookingPageCollectionSource(
+                page_source = AspriaBookingPageCollectionSource(
                     page=page,
                     booking_url=booking_start_url(self._config.club),
-                ).collect(scan_dates)
+                )
+                result = page_source.collect(scan_dates)
+                self._last_diagnostics = page_source.diagnostic_artifacts(observation=None)
+                return result
             finally:
                 browser.close()
+
+    def diagnostic_artifacts(
+        self,
+        *,
+        observation: BrowserCourseObservation | None,
+    ) -> tuple[str | None, bytes | None, dict[str, object]]:
+        return self._last_diagnostics
 
 
 class DryRunBrowserCollector:
@@ -390,6 +423,17 @@ class VerifiedActionRunner:
                         source=self._source,
                     )
                 )
+                continue
+            if observation.status == "pending_release":
+                decision = _decision(
+                    observation,
+                    observation_id,
+                    action_type="no_op",
+                    result="pending_release",
+                    reason="course is visible but not released for booking yet",
+                )
+                _record_decision(self._history, run_id, decision)
+                decisions.append(decision)
                 continue
             if observation.status == "full" and observation.available_action != "waitlist":
                 decisions.append(
@@ -682,7 +726,7 @@ def _collect_with_technical_artifact(
     scan_dates: list[date],
 ) -> tuple[list[BrowserCourseObservation], list[BrowserExistingState]]:
     try:
-        return source.collect(scan_dates)
+        observations, existing_states = source.collect(scan_dates)
     except Exception as error:
         _save_artifact(
             artifacts,
@@ -697,6 +741,20 @@ def _collect_with_technical_artifact(
             },
         )
         raise
+    if not observations:
+        _save_artifact(
+            artifacts,
+            source=source,
+            run_id=run_id,
+            trigger="unclear_status",
+            observation=None,
+            metadata={
+                "result": "no_observations",
+                "reason": "collector completed without finding course observations",
+                "scan_dates": [scan_date.isoformat() for scan_date in scan_dates],
+            },
+        )
+    return observations, existing_states
 
 
 def _diagnostic_artifacts(
@@ -709,6 +767,56 @@ def _diagnostic_artifacts(
     result = getattr(source, "diagnostic_artifacts")(observation=observation)
     html, screenshot, metadata = result
     return html, screenshot, dict(metadata)
+
+
+def _page_diagnostic_artifacts(
+    page: Any,
+    *,
+    observation: BrowserCourseObservation | None,
+) -> tuple[str | None, bytes | None, dict[str, object]]:
+    html = _safe_page_content(page)
+    screenshot = _safe_page_screenshot(page)
+    metadata: dict[str, object] = {
+        "page_url": str(getattr(page, "url", "")),
+    }
+    try:
+        metadata["page_title"] = str(page.title())
+    except Exception:
+        metadata["page_title"] = ""
+    if observation is not None:
+        metadata["diagnostic_observation"] = observation.name
+    return html, screenshot, metadata
+
+
+def _safe_page_content(page: Any) -> str | None:
+    try:
+        return str(page.content())
+    except Exception:
+        return None
+
+
+def _safe_page_screenshot(page: Any) -> bytes | None:
+    try:
+        return bytes(page.screenshot(full_page=True))
+    except Exception:
+        return None
+
+
+def _visible_text(page: Any) -> str:
+    try:
+        return str(page.locator("body").inner_text(timeout=2000))
+    except Exception:
+        try:
+            return str(page.content())
+        except Exception:
+            return ""
+
+
+def _settle_booking_context(page: Any) -> None:
+    try:
+        page.wait_for_timeout(3000)
+    except Exception:
+        return
 
 
 def _artifact_occurred_at(observation: BrowserCourseObservation | None) -> datetime | None:
@@ -865,6 +973,115 @@ def _existing_states_from_blocks(blocks: list[str], scan_date: date) -> list[Bro
     return states
 
 
+def _course_observations_from_mywellness_text(text: str, scan_date: date) -> list[BrowserCourseObservation]:
+    normalized = _normalize_visible_text(text)
+    if not normalized:
+        return []
+    if not _mywellness_text_matches_date(normalized, scan_date):
+        return []
+    matches = list(
+        re.finditer(
+            r"(?P<start>\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(?P<end>\d{1,2}:\d{2}\s*[AP]M)\s+"
+            r"(?P<name>.*?)(?=\s+trainer\s+|\s+room\s+|\s+BOOK\b|\s+\d{1,2}:\d{2}\s*[AP]M\s+-|$)",
+            normalized,
+            flags=re.I,
+        )
+    )
+    observations: list[BrowserCourseObservation] = []
+    for index, match in enumerate(matches):
+        name = _normalize_visible_text(match.group("name"))
+        if not name or name.lower() in {"book"}:
+            continue
+        start = _parse_ampm_time(match.group("start"))
+        end = _parse_ampm_time(match.group("end"))
+        if start is None or end is None:
+            continue
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        course_slice = normalized[match.start():next_start]
+        is_bookable = bool(re.search(r"\bBOOK\b", course_slice, flags=re.I))
+        observations.append(
+            BrowserCourseObservation(
+                name=name,
+                day=scan_date,
+                start=start,
+                duration_minutes=_duration_between(start, end),
+                status="free" if is_bookable else "pending_release",
+                available_action="book" if is_bookable else None,
+            )
+        )
+    return observations
+
+
+_MYWELLNESS_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_MYWELLNESS_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MYWELLNESS_MONTHS = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def _is_mywellness_context(context: Any) -> bool:
+    return "widgets.mywellness.com" in str(getattr(context, "url", ""))
+
+
+def _select_mywellness_date(page: Any, context: Any, scan_date: date) -> None:
+    current_text = _visible_text(context)
+    if _mywellness_text_matches_date(current_text, scan_date):
+        return
+    day = str(scan_date.day)
+    weekday = _MYWELLNESS_WEEKDAY_ABBR[scan_date.weekday()]
+    selectors = (
+        f"div.swiper-slide:has-text('{day}'):has-text('{weekday}')",
+        f"div:has-text('{day} {weekday}')",
+    )
+    if not _click_first_available(context, selectors):
+        raise RuntimeError(f"could not select MyWellness date {scan_date.isoformat()}")
+    _settle_booking_context(page)
+    updated_text = _visible_text(context)
+    if not _mywellness_text_matches_date(updated_text, scan_date):
+        raise RuntimeError(f"MyWellness date did not change to {scan_date.isoformat()}")
+
+
+def _mywellness_text_matches_date(text: str, scan_date: date) -> bool:
+    normalized = _normalize_visible_text(text)
+    weekday = _MYWELLNESS_WEEKDAYS[scan_date.weekday()]
+    month = _MYWELLNESS_MONTHS[scan_date.month]
+    return f"{weekday}, {scan_date.day} {month}" in normalized
+
+
+def _parse_ampm_time(value: str) -> time | None:
+    match = re.fullmatch(r"\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<period>[AP]M)\s*", value, flags=re.I)
+    if match is None:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    period = match.group("period").upper()
+    if hour == 12:
+        hour = 0
+    if period == "PM":
+        hour += 12
+    return time(hour, minute)
+
+
+def _duration_between(start: time, end: time) -> int | None:
+    start_minutes = start.hour * 60 + start.minute
+    end_minutes = end.hour * 60 + end.minute
+    if end_minutes < start_minutes:
+        return None
+    return end_minutes - start_minutes
+
+
 def _parse_course_block(block: str, scan_date: date) -> BrowserCourseObservation | None:
     parsed = _parse_course_identity(block, scan_date)
     if parsed is None:
@@ -916,7 +1133,28 @@ def _status_and_action_from_german_text(block: str) -> tuple[CourseStatus, Avail
         return "free", "book"
     if "ausgebucht" in normalized or "keine plaetze" in normalized:
         return "full", None
+    if _looks_pending_release(normalized):
+        return "pending_release", None
     return "unclear", None
+
+
+def _looks_pending_release(normalized: str) -> bool:
+    return any(
+        marker in normalized
+        for marker in (
+            "noch nicht buchbar",
+            "noch nicht verfuegbar",
+            "noch nicht verfugbar",
+            "bald buchbar",
+            "buchung ab",
+            "buchbar ab",
+            "veroeffentlich",
+            "veroffentlich",
+            "wird freigeschaltet",
+            "freischaltung",
+            "nicht freigeschaltet",
+        )
+    )
 
 
 def _existing_state_from_block(block: str) -> ExistingState | None:
@@ -938,7 +1176,7 @@ def _looks_like_booking_page(html: str) -> bool:
     normalized = _normalize_german(html)
     return any(
         marker in normalized
-        for marker in ("kurs buchen", "meine buchungen", "freie plaetze", "warteliste")
+        for marker in ("meine buchungen", "freie plaetze", "warteliste")
     ) or re.search(r"\b\d{2}\.\d{2}\.\d{4}\s+[0-2]\d:[0-5]\d\b", normalized) is not None
 
 

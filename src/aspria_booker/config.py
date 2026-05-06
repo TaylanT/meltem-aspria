@@ -201,8 +201,8 @@ def _validate(config: BookerConfig, *, require_live_credentials: bool) -> None:
     slow_stop = _minutes_from_text(config.release_job.slow_poll_until)
     if not release_start <= tight_stop <= slow_stop:
         raise ConfigError("release polling times must be ordered from start through slow stop")
-    if not 5 <= config.release_job.tight_interval_seconds <= 10:
-        raise ConfigError("tight polling interval must be between 5 and 10 seconds")
+    if config.release_job.tight_interval_seconds < 5:
+        raise ConfigError("tight polling interval must be at least 5 seconds")
     if config.release_job.slow_interval_seconds < 1:
         raise ConfigError("poll intervals must not be negative")
     if config.hourly_job.lookahead_days < 0:

@@ -71,6 +71,14 @@ def test_loads_yaml_and_env_without_requiring_live_credentials(tmp_path: Path) -
     assert config.secrets["ASPRIA_PASSWORD"] == "secret"
 
 
+def test_allows_longer_tight_polling_interval(tmp_path: Path) -> None:
+    config_text = valid_config().replace("tight_interval_seconds: 5", "tight_interval_seconds: 60")
+
+    config = load_config(write_config(tmp_path, config_text))
+
+    assert config.release_job.tight_interval_seconds == 60
+
+
 @pytest.mark.parametrize(
     ("patch", "message"),
     [

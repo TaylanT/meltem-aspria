@@ -121,6 +121,7 @@ class AspriaBookingPageCollectionSource:
                 return
         self._page.goto(self._fallback_url, wait_until="domcontentloaded")
         _dismiss_cookie_banner(self._page)
+        _settle_booking_context(self._page)
         popup = _click_first_available_with_popup(
             self._page,
             (
@@ -199,9 +200,10 @@ class PlaywrightCourseCollectionSource:
                     page=page,
                     booking_url=booking_start_url(self._config.club),
                 )
-                result = page_source.collect(scan_dates)
-                self._last_diagnostics = page_source.diagnostic_artifacts(observation=None)
-                return result
+                try:
+                    return page_source.collect(scan_dates)
+                finally:
+                    self._last_diagnostics = page_source.diagnostic_artifacts(observation=None)
             finally:
                 browser.close()
 
@@ -1277,6 +1279,20 @@ def _click_first_available_with_popup(page: Any, selectors: tuple[str, ...]) -> 
 
 
 def _click_locator_capturing_popup(page: Any, locator: Any) -> Any | None:
+    expect_popup = getattr(page, "expect_popup", None)
+    if callable(expect_popup):
+        try:
+            with expect_popup(timeout=5000) as popup_info:
+                locator.click()
+            popup = popup_info.value
+            try:
+                popup.wait_for_load_state("domcontentloaded")
+            except Exception:
+                pass
+            return popup
+        except Exception:
+            return None
+
     context = getattr(page, "context", None)
     pages_before = list(getattr(context, "pages", [])) if context is not None else []
     locator.click()

@@ -121,23 +121,24 @@ class AspriaBookingPageCollectionSource:
                 return
         self._page.goto(self._fallback_url, wait_until="domcontentloaded")
         _dismiss_cookie_banner(self._page)
-        _settle_booking_context(self._page)
-        popup = _click_first_available_with_popup(
-            self._page,
-            (
-                "a:has-text('Kurs buchen')",
-                "button:has-text('Kurs buchen')",
-                "a:has-text('Kurs Buchen')",
-                "button:has-text('Kurs Buchen')",
-                "a:has-text('KURS BUCHEN')",
-                "button:has-text('KURS BUCHEN')",
-            ),
+        selectors = (
+            "a:has-text('Kurs buchen')",
+            "button:has-text('Kurs buchen')",
+            "a:has-text('Kurs Buchen')",
+            "button:has-text('Kurs Buchen')",
+            "a:has-text('KURS BUCHEN')",
+            "button:has-text('KURS BUCHEN')",
         )
-        if popup is not None:
-            self._page = popup
-        _settle_booking_context(self._page)
-        _dismiss_cookie_banner(self._page)
-        _wait_for_mywellness_text(self._page)
+        for _ in range(4):
+            _settle_booking_context(self._page)
+            popup = _click_first_available_with_popup(self._page, selectors)
+            if popup is not None:
+                self._page = popup
+            _settle_booking_context(self._page)
+            _dismiss_cookie_banner(self._page)
+            _wait_for_mywellness_text(self._page)
+            if _has_booking_context(self._page):
+                return
         _ensure_booking_context_reached(self._page)
 
     def _select_scan_date(self, scan_date: date) -> None:
@@ -1200,18 +1201,25 @@ def _looks_like_booking_page(html: str) -> bool:
 
 
 def _ensure_booking_context_reached(page: Any) -> None:
-    html = str(page.content())
-    if _looks_like_booking_page(html):
+    if _has_booking_context(page):
         return
-    for frame in getattr(page, "frames", []):
-        if "widgets.mywellness.com" in str(getattr(frame, "url", "")):
-            return
     title = _safe_page_title(page)
     page_url = str(getattr(page, "url", ""))
+    html = str(page.content())
     if _looks_like_public_club_page(title=title, url=page_url, html=html):
         raise RuntimeError(
             "booking navigation ended on public Aspria club page instead of the course booking flow"
         )
+
+
+def _has_booking_context(page: Any) -> bool:
+    html = str(page.content())
+    if _looks_like_booking_page(html):
+        return True
+    for frame in getattr(page, "frames", []):
+        if "widgets.mywellness.com" in str(getattr(frame, "url", "")):
+            return True
+    return False
 
 
 def _looks_like_public_club_page(*, title: str, url: str, html: str) -> bool:

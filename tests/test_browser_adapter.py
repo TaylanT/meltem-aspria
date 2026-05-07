@@ -686,9 +686,19 @@ class FakePageLocator:
 
 
 class FakeBookingPage:
-    def __init__(self, pages: dict[str, str], *, url: str = "about:blank") -> None:
+    def __init__(
+        self,
+        pages: dict[str, str],
+        *,
+        url: str = "about:blank",
+        title: str = "Fake Booking Page",
+        popup_pages: dict[str, "FakeBookingPage"] | None = None,
+    ) -> None:
         self.pages = pages
         self.url = url
+        self._title = title
+        self.context = FakeBrowserContext([self])
+        self.popup_pages = popup_pages or {}
         self.visited: list[str] = []
         self.clicked: list[str] = []
 
@@ -696,11 +706,17 @@ class FakeBookingPage:
         self.visited.append(url)
         self.url = url
 
+    def wait_for_timeout(self, _: int) -> None:
+        return None
+
+    def wait_for_load_state(self, _: str) -> None:
+        return None
+
     def content(self) -> str:
         return self.pages.get(self.url, "")
 
     def title(self) -> str:
-        return "Fake Booking Page"
+        return self._title
 
     def screenshot(self, *, full_page: bool) -> bytes:
         return b"fake-screenshot"
@@ -709,6 +725,8 @@ class FakeBookingPage:
         return FakePageLocator(self, selector)
 
     def count(self, selector: str) -> int:
+        if selector in self.popup_pages and "Kurs buchen" in self.content():
+            return 1
         if selector == "a:has-text('Kurs Buchen')" and "Kurs Buchen" in self.content():
             return 1
         if selector == "button:has-text('05.05.2026')" and "<button>05.05.2026</button>" in self.content():
@@ -716,10 +734,18 @@ class FakeBookingPage:
         return 0
 
     def apply_click(self, selector: str) -> None:
+        if selector in self.popup_pages:
+            self.context.pages.append(self.popup_pages[selector])
+            return
         if selector == "a:has-text('Kurs Buchen')":
             self.url = "https://example.invalid/kursbuchung"
         if selector == "button:has-text('05.05.2026')":
             self.url = "https://example.invalid/kursbuchung?date=2026-05-05"
+
+
+class FakeBrowserContext:
+    def __init__(self, pages: list[FakeBookingPage]) -> None:
+        self.pages = pages
 
 
 def test_aspria_page_source_falls_back_selects_date_and_collects_german_course_states() -> None:
@@ -812,6 +838,60 @@ def test_aspria_page_source_does_not_treat_public_kurs_buchen_link_as_booking_pa
 
     assert page.clicked == ["a:has-text('Kurs Buchen')", "button:has-text('05.05.2026')"]
     assert [observation.name for observation in observations] == ["LES MILLS BODYPUMP"]
+
+
+def test_aspria_page_source_uses_popup_opened_by_public_kurs_buchen_link() -> None:
+    popup = FakeBookingPage(
+        {
+            "https://example.invalid/mywellness": "<button>05.05.2026</button>",
+            "https://example.invalid/kursbuchung?date=2026-05-05": """
+                <article>LES MILLS BODYPUMP 05.05.2026 10:00 60 Min. Freie Plaetze Buchen</article>
+            """,
+        },
+        url="https://example.invalid/mywellness",
+    )
+    page = FakeBookingPage(
+        {
+            "https://www.aspria.com/de/hannover-maschsee": "<main><a>Kurs buchen</a></main>",
+        },
+        popup_pages={"a:has-text('Kurs buchen')": popup},
+    )
+
+    observations, _ = AspriaBookingPageCollectionSource(
+        page=page,
+        booking_url="https://www.aspria.com/de/hannover-maschsee",
+    ).collect([date(2026, 5, 5)])
+
+    assert page.clicked == ["a:has-text('Kurs buchen')"]
+    assert popup.clicked == ["button:has-text('05.05.2026')"]
+    assert [observation.name for observation in observations] == ["LES MILLS BODYPUMP"]
+
+
+def test_aspria_page_source_fails_when_navigation_stays_on_public_club_page() -> None:
+    page = FakeBookingPage(
+        {
+            "https://www.aspria.com/de/hannover-maschsee": """
+                <main>
+                  <a>Kurs buchen</a>
+                  <a>Spa buchen</a>
+                  <a>Hotel buchen</a>
+                  <a>Mitgliedschaft</a>
+                  <a>Anfrage senden</a>
+                </main>
+            """,
+        },
+        title="Aspria Maschsee Hannover",
+    )
+
+    try:
+        AspriaBookingPageCollectionSource(
+            page=page,
+            booking_url="https://www.aspria.com/de/hannover-maschsee",
+        ).collect([date(2026, 5, 5)])
+    except RuntimeError as error:
+        assert str(error) == "booking navigation ended on public Aspria club page instead of the course booking flow"
+    else:
+        raise AssertionError("expected public page navigation failure")
 
 
 def test_mywellness_visible_text_parser_extracts_course_rows() -> None:

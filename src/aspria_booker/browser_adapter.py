@@ -121,10 +121,23 @@ class AspriaBookingPageCollectionSource:
                 return
         self._page.goto(self._fallback_url, wait_until="domcontentloaded")
         _dismiss_cookie_banner(self._page)
-        _click_first_available(self._page, ("a:has-text('Kurs Buchen')", "button:has-text('Kurs Buchen')"))
+        popup = _click_first_available_with_popup(
+            self._page,
+            (
+                "a:has-text('Kurs buchen')",
+                "button:has-text('Kurs buchen')",
+                "a:has-text('Kurs Buchen')",
+                "button:has-text('Kurs Buchen')",
+                "a:has-text('KURS BUCHEN')",
+                "button:has-text('KURS BUCHEN')",
+            ),
+        )
+        if popup is not None:
+            self._page = popup
         _settle_booking_context(self._page)
         _dismiss_cookie_banner(self._page)
         _wait_for_mywellness_text(self._page)
+        _ensure_booking_context_reached(self._page)
 
     def _select_scan_date(self, scan_date: date) -> None:
         booking_context = self._booking_context()
@@ -1184,6 +1197,43 @@ def _looks_like_booking_page(html: str) -> bool:
     ) or re.search(r"\b\d{2}\.\d{2}\.\d{4}\s+[0-2]\d:[0-5]\d\b", normalized) is not None
 
 
+def _ensure_booking_context_reached(page: Any) -> None:
+    html = str(page.content())
+    if _looks_like_booking_page(html):
+        return
+    for frame in getattr(page, "frames", []):
+        if "widgets.mywellness.com" in str(getattr(frame, "url", "")):
+            return
+    title = _safe_page_title(page)
+    page_url = str(getattr(page, "url", ""))
+    if _looks_like_public_club_page(title=title, url=page_url, html=html):
+        raise RuntimeError(
+            "booking navigation ended on public Aspria club page instead of the course booking flow"
+        )
+
+
+def _looks_like_public_club_page(*, title: str, url: str, html: str) -> bool:
+    normalized_title = _normalize_german(title)
+    normalized_url = url.lower()
+    normalized_html = _normalize_german(html)
+    if "widgets.mywellness.com" in normalized_url:
+        return False
+    return (
+        "aspria.com/de/hannover-maschsee" in normalized_url
+        or "aspria maschsee hannover" in normalized_title
+    ) and any(
+        marker in normalized_html
+        for marker in ("spa buchen", "hotel buchen", "mitgliedschaft", "anfrage senden")
+    )
+
+
+def _safe_page_title(page: Any) -> str:
+    try:
+        return str(page.title())
+    except Exception:
+        return ""
+
+
 _COOKIE_CONSENT_SELECTORS = (
     "#accept-btn",
     "#qc-cmp2-container #accept-btn",
@@ -1211,15 +1261,39 @@ def _wait_for_mywellness_text(page: Any) -> None:
 
 
 def _click_first_available(page: Any, selectors: tuple[str, ...]) -> bool:
+    return _click_first_available_with_popup(page, selectors) is not None
+
+
+def _click_first_available_with_popup(page: Any, selectors: tuple[str, ...]) -> Any | None:
     for selector in selectors:
         try:
             locator = page.locator(selector)
             if locator.count() > 0:
-                locator.first.click()
-                return True
+                popup = _click_locator_capturing_popup(page, locator.first)
+                return popup or page
         except Exception:
             continue
-    return False
+    return None
+
+
+def _click_locator_capturing_popup(page: Any, locator: Any) -> Any | None:
+    context = getattr(page, "context", None)
+    pages_before = list(getattr(context, "pages", [])) if context is not None else []
+    locator.click()
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+    pages_after = list(getattr(context, "pages", [])) if context is not None else []
+    new_pages = [candidate for candidate in pages_after if candidate not in pages_before]
+    if not new_pages:
+        return None
+    popup = new_pages[-1]
+    try:
+        popup.wait_for_load_state("domcontentloaded")
+    except Exception:
+        pass
+    return popup
 
 
 def _normalize_visible_text(value: str) -> str:

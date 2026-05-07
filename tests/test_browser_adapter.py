@@ -693,12 +693,14 @@ class FakeBookingPage:
         url: str = "about:blank",
         title: str = "Fake Booking Page",
         popup_pages: dict[str, "FakeBookingPage"] | None = None,
+        consent_overlay: bool = False,
     ) -> None:
         self.pages = pages
         self.url = url
         self._title = title
         self.context = FakeBrowserContext([self])
         self.popup_pages = popup_pages or {}
+        self.consent_overlay = consent_overlay
         self.visited: list[str] = []
         self.clicked: list[str] = []
 
@@ -725,6 +727,12 @@ class FakeBookingPage:
         return FakePageLocator(self, selector)
 
     def count(self, selector: str) -> int:
+        if self.consent_overlay and selector in {
+            "#accept-btn",
+            "#qc-cmp2-container",
+            "#qc-cmp2-container #accept-btn",
+        }:
+            return 1
         if selector in self.popup_pages and "Kurs buchen" in self.content():
             return 1
         if selector == "a:has-text('Kurs Buchen')" and "Kurs Buchen" in self.content():
@@ -734,6 +742,9 @@ class FakeBookingPage:
         return 0
 
     def apply_click(self, selector: str) -> None:
+        if selector in {"#accept-btn", "#qc-cmp2-container #accept-btn"}:
+            self.consent_overlay = False
+            return
         if selector in self.popup_pages:
             self.context.pages.append(self.popup_pages[selector])
             return
@@ -864,6 +875,28 @@ def test_aspria_page_source_uses_popup_opened_by_public_kurs_buchen_link() -> No
 
     assert page.clicked == ["a:has-text('Kurs buchen')"]
     assert popup.clicked == ["button:has-text('05.05.2026')"]
+    assert [observation.name for observation in observations] == ["LES MILLS BODYPUMP"]
+
+
+def test_aspria_page_source_dismisses_consent_overlay_before_booking_link() -> None:
+    page = FakeBookingPage(
+        {
+            "https://www.aspria.com/de/hannover-maschsee": "<main><a>Kurs Buchen</a></main>",
+            "https://example.invalid/kursbuchung": "<button>05.05.2026</button>",
+            "https://example.invalid/kursbuchung?date=2026-05-05": """
+                <article>LES MILLS BODYPUMP 05.05.2026 10:00 60 Min. Freie Plaetze Buchen</article>
+            """,
+        },
+        consent_overlay=True,
+    )
+
+    observations, _ = AspriaBookingPageCollectionSource(
+        page=page,
+        booking_url="https://www.aspria.com/de/hannover-maschsee",
+    ).collect([date(2026, 5, 5)])
+
+    assert page.clicked[:2] == ["#accept-btn", "a:has-text('Kurs Buchen')"]
+    assert page.consent_overlay is False
     assert [observation.name for observation in observations] == ["LES MILLS BODYPUMP"]
 
 

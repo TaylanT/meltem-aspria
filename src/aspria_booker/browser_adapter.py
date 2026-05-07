@@ -1247,6 +1247,24 @@ def _safe_page_title(page: Any) -> str:
 _COOKIE_CONSENT_SELECTORS = (
     "#accept-btn",
     "#qc-cmp2-container #accept-btn",
+    "#qc-cmp2-container button:has-text('ALLE AKZEPTIEREN')",
+    "#qc-cmp2-container button:has-text('Alle akzeptieren')",
+    "#qc-cmp2-container button:has-text('ZUSTIMMEN')",
+    "#qc-cmp2-container button:has-text('Zustimmen')",
+    "#qc-cmp2-container button:has-text('AKZEPTIEREN')",
+    "#qc-cmp2-container button:has-text('Akzeptieren')",
+    "#qc-cmp2-container button:has-text('ACCEPT ALL')",
+    "#qc-cmp2-container button:has-text('Accept all')",
+    "#qc-cmp2-container button:has-text('AGREE')",
+    "#qc-cmp2-container button:has-text('Agree')",
+    "#qc-cmp2-container button:has-text('CONFIRM')",
+    "#qc-cmp2-container button:has-text('Confirm')",
+    "#qc-cmp2-container button:has-text('BESTAETIGEN')",
+    "#qc-cmp2-container button:has-text('Bestätigen')",
+    "#qc-usp-ui button:has-text('CONFIRM')",
+    "#qc-usp-ui button:has-text('Confirm')",
+    "#qc-usp-ui button:has-text('SAVE')",
+    "#qc-usp-ui button:has-text('Save')",
     "button:has-text('ZUSTIMMEN')",
     "button:has-text('ALLE AKZEPTIEREN')",
     "button:has-text('ACCEPT ALL')",
@@ -1255,8 +1273,74 @@ _COOKIE_CONSENT_SELECTORS = (
 
 
 def _dismiss_cookie_banner(page: Any) -> None:
-    if _click_first_available(page, _COOKIE_CONSENT_SELECTORS):
-        _settle_booking_context(page)
+    for _ in range(3):
+        if not _has_consent_overlay(page) and not _has_any_selector(page, _COOKIE_CONSENT_SELECTORS):
+            return
+        if _click_first_available_direct(page, _COOKIE_CONSENT_SELECTORS, force=True):
+            _settle_booking_context(page)
+        if not _has_consent_overlay(page):
+            return
+
+
+_CONSENT_OVERLAY_SELECTORS = (
+    "#qc-cmp2-container",
+    ".qc-cmp2-container",
+    "#qc-usp-ui",
+    ".qc-usp-ui",
+)
+
+
+def _has_consent_overlay(page: Any) -> bool:
+    for selector in _CONSENT_OVERLAY_SELECTORS:
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0 and _locator_visible(locator.first):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _has_any_selector(page: Any, selectors: tuple[str, ...]) -> bool:
+    for selector in selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _locator_visible(locator: Any) -> bool:
+    is_visible = getattr(locator, "is_visible", None)
+    if not callable(is_visible):
+        return True
+    try:
+        return bool(is_visible())
+    except Exception:
+        return True
+
+
+def _click_first_available_direct(page: Any, selectors: tuple[str, ...], *, force: bool = False) -> bool:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0:
+                _click_locator_direct(locator.first, force=force)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_locator_direct(locator: Any, *, force: bool) -> None:
+    if force:
+        try:
+            locator.click(force=True, timeout=5000)
+            return
+        except TypeError:
+            pass
+    locator.click()
 
 
 def _wait_for_mywellness_text(page: Any) -> None:
